@@ -3,11 +3,40 @@ import { toFetchResponse, toReqRes } from "fetch-to-node";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import twilio from "twilio";
+import { validateBearerToken, getBaseUrl } from "./oauth-helpers.js";
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id",
+};
 
 // ─── Netlify Serverless Function Handler ───────────────────────────────────────
 export default async (req) => {
   try {
+    // Handle CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // Validate Bearer token for POST requests (MCP calls)
     if (req.method === "POST") {
+      const tokenPayload = validateBearerToken(req);
+      if (!tokenPayload) {
+        const baseUrl = getBaseUrl();
+        return new Response(
+          JSON.stringify({ error: "unauthorized" }),
+          {
+            status: 401,
+            headers: {
+              ...CORS_HEADERS,
+              "Content-Type": "application/json",
+              "WWW-Authenticate": `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
+            },
+          }
+        );
+      }
+
       const { req: nodeReq, res: nodeRes } = toReqRes(req);
       const server = getServer();
       const transport = new StreamableHTTPServerTransport({
@@ -35,12 +64,12 @@ export default async (req) => {
         }),
         {
           status: 200,
-          headers: { "Content-Type": "application/json" },
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
         }
       );
     }
 
-    return new Response("Method not allowed", { status: 405 });
+    return new Response("Method not allowed", { status: 405, headers: CORS_HEADERS });
   } catch (error) {
     console.error("MCP error:", error);
     return new Response(
