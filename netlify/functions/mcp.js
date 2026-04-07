@@ -89,6 +89,16 @@ export default async (req) => {
   }
 };
 
+// ─── XML Escape Helper (for safe TwiML construction) ──────────────────────────
+function escapeXml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 // ─── Twilio Client Helper ──────────────────────────────────────────────────────
 function getTwilioClient() {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -409,6 +419,152 @@ function getServer() {
       } catch (err) {
         return {
           content: [{ type: "text", text: `Error fetching call: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "make-voice-survey",
+    "Make an outbound call that conducts a voice survey. The call speaks each question in sequence and collects answers via keypad (DTMF digits), live speech recognition, or voice recording. When the survey ends, results are sent as an SMS to the specified number. Use this to ask someone a question or series of questions and report back the answers.",
+    {
+      to: z
+        .string()
+        .describe("Phone number to call (E.164, e.g. +15551234567)"),
+      from: z
+        .string()
+        .optional()
+        .describe(
+          "Twilio number to call from (E.164). Defaults to TWILIO_PHONE_NUMBER env var."
+        ),
+      greeting: z
+        .string()
+        .optional()
+        .describe(
+          "Opening message spoken when the call is answered, before any questions."
+        ),
+      closing: z
+        .string()
+        .optional()
+        .describe(
+          "Closing message spoken after all questions. Defaults to 'Thank you for completing our survey. Goodbye!'"
+        ),
+      questions: z
+        .array(
+          z.object({
+            text: z
+              .string()
+              .describe(
+                "The question text, spoken aloud via text-to-speech."
+              ),
+            type: z
+              .enum(["keypad", "speech", "voice"])
+              .describe(
+                "How to collect the answer. 'keypad' = DTMF digit(s) pressed by the caller. 'speech' = spoken answer captured inline via speech recognition (best for short answers). 'voice' = full voice recording (best for longer free-form answers)."
+              ),
+            maxDigits: z
+              .number()
+              .optional()
+              .describe(
+                "For keypad type: number of digits to collect (default 1)."
+              ),
+            maxLength: z
+              .number()
+              .optional()
+              .describe(
+                "For voice type: max recording length in seconds (default 60)."
+              ),
+            speechTimeout: z
+              .union([z.number(), z.literal("auto")])
+              .optional()
+              .describe(
+                "For speech type: seconds of silence before capturing is done, or 'auto' (default)."
+              ),
+            timeout: z
+              .number()
+              .optional()
+              .describe(
+                "For keypad type: seconds to wait for input before moving on (default 10)."
+              ),
+          })
+        )
+        .min(1)
+        .describe("Ordered list of questions to ask during the call."),
+      resultsTo: z
+        .string()
+        .optional()
+        .describe(
+          "Phone number to SMS the survey results to after the call completes. Defaults to the 'to' number."
+        ),
+    },
+    async ({ to, from, greeting, closing, questions, resultsTo }) => {
+      try {
+        const client = getTwilioClient();
+        const fromNumber = from || process.env.TWILIO_PHONE_NUMBER;
+        if (!fromNumber) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: No 'from' number and TWILIO_PHONE_NUMBER env var is not set.",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const baseUrl = getBaseUrl();
+        const surveyWebhookBase = `${baseUrl}/.netlify/functions/voice-survey`;
+
+        const questionsEncoded = Buffer.from(
+          JSON.stringify(questions)
+        ).toString("base64url");
+
+        const surveyUrl = new URL(surveyWebhookBase);
+        surveyUrl.searchParams.set("step", "0");
+        surveyUrl.searchParams.set("questions", questionsEncoded);
+        surveyUrl.searchParams.set("resultsTo", resultsTo || to);
+        surveyUrl.searchParams.set(
+          "closing",
+          closing || "Thank you for completing our survey. Goodbye!"
+        );
+        if (greeting) surveyUrl.searchParams.set("greeting", greeting);
+        surveyUrl.searchParams.set("baseUrl", surveyWebhookBase);
+
+        // Initial TwiML just redirects to the survey webhook
+        const initialTwiml = `<Response><Redirect method="POST">${escapeXml(
+          surveyUrl.toString()
+        )}</Redirect></Response>`;
+
+        const call = await client.calls.create({
+          to,
+          from: fromNumber,
+          twiml: initialTwiml,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                callSid: call.sid,
+                to: call.to,
+                from: call.from,
+                status: call.status,
+                questionCount: questions.length,
+                resultsWillBeSentTo: resultsTo || to,
+                message: `Survey call initiated with ${questions.length} question(s). Results will be sent via SMS to ${resultsTo || to} after the survey completes.`,
+              }),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            { type: "text", text: `Error making survey call: ${err.message}` },
+          ],
           isError: true,
         };
       }
@@ -739,6 +895,232 @@ function getServer() {
   );
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // TWIML BUILDER
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  server.tool(
+    "build-twiml",
+    "Build a TwiML XML string for use with the make-call tool. Supports Say (text-to-speech), Play (audio file), Gather (collect DTMF digits or speech), Record (voice recording), Dial (connect to another number), and Pause verbs. Returns the TwiML XML string to pass as the 'twiml' parameter of make-call.",
+    {
+      verbs: z
+        .array(
+          z.object({
+            type: z
+              .enum(["say", "play", "pause", "gather", "record", "dial"])
+              .describe(
+                "TwiML verb type: say, play, pause, gather, record, or dial."
+              ),
+            // say
+            text: z
+              .string()
+              .optional()
+              .describe(
+                "For 'say': text to speak. For 'gather': optional prompt to speak while collecting input."
+              ),
+            voice: z
+              .string()
+              .optional()
+              .describe(
+                "For 'say': voice name (e.g. alice, man, woman, Polly.Joanna)."
+              ),
+            language: z
+              .string()
+              .optional()
+              .describe(
+                "For 'say' / 'gather': language/locale code (e.g. en-US, es-MX)."
+              ),
+            // play
+            url: z
+              .string()
+              .optional()
+              .describe("For 'play': URL of audio file to play."),
+            loop: z
+              .number()
+              .optional()
+              .describe(
+                "For 'play': number of times to play (0 = infinite, default 1)."
+              ),
+            // pause
+            length: z
+              .number()
+              .optional()
+              .describe("For 'pause': seconds to pause (default 1)."),
+            // gather
+            input: z
+              .enum(["dtmf", "speech", "dtmf speech"])
+              .optional()
+              .describe(
+                "For 'gather': input mode — dtmf, speech, or dtmf speech (default dtmf)."
+              ),
+            action: z
+              .string()
+              .optional()
+              .describe(
+                "For 'gather' / 'record': URL to POST collected input or recording details to."
+              ),
+            numDigits: z
+              .number()
+              .optional()
+              .describe(
+                "For 'gather': stop after this many digits are collected."
+              ),
+            finishOnKey: z
+              .string()
+              .optional()
+              .describe(
+                "For 'gather' / 'record': key that ends collection (default # for record, * for gather)."
+              ),
+            timeout: z
+              .number()
+              .optional()
+              .describe(
+                "For 'gather' / 'dial': seconds to wait for input or answer."
+              ),
+            // record
+            maxLength: z
+              .number()
+              .optional()
+              .describe("For 'record': max recording length in seconds."),
+            transcribe: z
+              .boolean()
+              .optional()
+              .describe("For 'record': whether to transcribe the recording."),
+            transcribeCallback: z
+              .string()
+              .optional()
+              .describe(
+                "For 'record': URL to POST the transcription result to."
+              ),
+            playBeep: z
+              .boolean()
+              .optional()
+              .describe(
+                "For 'record': play a beep before recording starts (default true)."
+              ),
+            // dial
+            number: z
+              .string()
+              .optional()
+              .describe(
+                "For 'dial': E.164 phone number or SIP URI to connect to."
+              ),
+            callerId: z
+              .string()
+              .optional()
+              .describe("For 'dial': caller ID to present to the dialed party."),
+            record: z
+              .enum([
+                "do-not-record",
+                "record-from-answer",
+                "record-from-ringing",
+                "record-from-answer-dual",
+                "record-from-ringing-dual",
+              ])
+              .optional()
+              .describe("For 'dial': recording mode."),
+          })
+        )
+        .min(1)
+        .describe("Ordered list of TwiML verbs to include in the response."),
+    },
+    async ({ verbs }) => {
+      try {
+        let twiml = "<Response>";
+
+        for (const verb of verbs) {
+          switch (verb.type) {
+            case "say": {
+              if (!verb.text) break;
+              const attrs = [];
+              if (verb.voice) attrs.push(`voice="${escapeXml(verb.voice)}"`);
+              if (verb.language)
+                attrs.push(`language="${escapeXml(verb.language)}"`);
+              twiml += `<Say${attrs.length ? " " + attrs.join(" ") : ""}>${escapeXml(verb.text)}</Say>`;
+              break;
+            }
+            case "play": {
+              if (!verb.url) break;
+              const attrs = [];
+              if (verb.loop !== undefined) attrs.push(`loop="${verb.loop}"`);
+              twiml += `<Play${attrs.length ? " " + attrs.join(" ") : ""}>${escapeXml(verb.url)}</Play>`;
+              break;
+            }
+            case "pause": {
+              twiml += `<Pause length="${verb.length ?? 1}"/>`;
+              break;
+            }
+            case "gather": {
+              const attrs = [];
+              if (verb.input) attrs.push(`input="${escapeXml(verb.input)}"`);
+              if (verb.action)
+                attrs.push(`action="${escapeXml(verb.action)}"`);
+              if (verb.numDigits !== undefined)
+                attrs.push(`numDigits="${verb.numDigits}"`);
+              if (verb.finishOnKey !== undefined)
+                attrs.push(`finishOnKey="${escapeXml(verb.finishOnKey)}"`);
+              if (verb.timeout !== undefined)
+                attrs.push(`timeout="${verb.timeout}"`);
+              if (verb.language)
+                attrs.push(`language="${escapeXml(verb.language)}"`);
+              const inner = verb.text
+                ? `<Say>${escapeXml(verb.text)}</Say>`
+                : "";
+              twiml += `<Gather${attrs.length ? " " + attrs.join(" ") : ""}>${inner}</Gather>`;
+              break;
+            }
+            case "record": {
+              const attrs = [];
+              if (verb.action)
+                attrs.push(`action="${escapeXml(verb.action)}"`);
+              if (verb.maxLength !== undefined)
+                attrs.push(`maxLength="${verb.maxLength}"`);
+              if (verb.transcribe !== undefined)
+                attrs.push(`transcribe="${verb.transcribe}"`);
+              if (verb.transcribeCallback)
+                attrs.push(
+                  `transcribeCallback="${escapeXml(verb.transcribeCallback)}"`
+                );
+              if (verb.finishOnKey !== undefined)
+                attrs.push(`finishOnKey="${escapeXml(verb.finishOnKey)}"`);
+              if (verb.playBeep !== undefined)
+                attrs.push(`playBeep="${verb.playBeep}"`);
+              twiml += `<Record${attrs.length ? " " + attrs.join(" ") : ""}/>`;
+              break;
+            }
+            case "dial": {
+              if (!verb.number) break;
+              const attrs = [];
+              if (verb.callerId)
+                attrs.push(`callerId="${escapeXml(verb.callerId)}"`);
+              if (verb.timeout !== undefined)
+                attrs.push(`timeout="${verb.timeout}"`);
+              if (verb.record)
+                attrs.push(`record="${escapeXml(verb.record)}"`);
+              twiml += `<Dial${attrs.length ? " " + attrs.join(" ") : ""}>${escapeXml(verb.number)}</Dial>`;
+              break;
+            }
+            default:
+              break;
+          }
+        }
+
+        twiml += "</Response>";
+
+        return {
+          content: [{ type: "text", text: JSON.stringify({ twiml }) }],
+        };
+      } catch (err) {
+        return {
+          content: [
+            { type: "text", text: `Error building TwiML: ${err.message}` },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // RESOURCES (context for AI agents)
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -765,6 +1147,8 @@ SMS TOOLS:
 
 VOICE TOOLS:
   - make-call: Start an outbound call (requires TwiML URL or inline TwiML)
+  - make-voice-survey: Call someone and ask a series of questions, collecting answers via keypad, speech, or voice recording. Results sent by SMS.
+  - build-twiml: Build a TwiML XML string combining Say/Play/Gather/Record/Dial/Pause verbs for use with make-call
   - list-calls: Browse recent calls with filters
   - get-call: Get details of a specific call by SID
 
@@ -785,7 +1169,9 @@ SIDs: Twilio uses SID identifiers:
 TIPS:
   - Use list-calls first to find call SIDs, then list-recordings to find recordings for that call
   - Transcriptions must be enabled on the recording to be available
-  - The default 'from' number uses the TWILIO_PHONE_NUMBER environment variable`,
+  - The default 'from' number uses the TWILIO_PHONE_NUMBER environment variable
+  - make-voice-survey is the easiest way to collect information from a contact: provide questions with type 'keypad' (press 1, 2, etc.), 'speech' (spoken answer via recognition), or 'voice' (recorded response). SMS results arrive after the call ends.
+  - build-twiml generates reusable TwiML XML. Pass the resulting 'twiml' value directly to make-call.`,
         },
       ],
     })
